@@ -481,6 +481,14 @@ public sealed partial class MainForm
 
     private async Task RefreshImodCurrentValuesAsync(bool showReadingStatus = true, string reason = "refresh")
     {
+        List<DeviceBlock> testBlocks = _blocks
+            .Where(b => IsUsbImodTarget(b.Device) && b.Device.IsTestDevice)
+            .ToList();
+        foreach (DeviceBlock block in testBlocks)
+        {
+            RefreshTestImodPreview(block, reason);
+        }
+
         List<DeviceBlock> targetBlocks = _blocks
             .Where(b => IsUsbImodTarget(b.Device) && !b.Device.IsTestDevice)
             .ToList();
@@ -488,11 +496,11 @@ public sealed partial class MainForm
 
         if (targetBlocks.Count == 0)
         {
-            WriteLog($"IMOD.READBACK.START: reason={reason} targets=0");
+            WriteLog($"IMOD.READBACK.START: reason={reason} targets=0 testTargets={testBlocks.Count}");
             return;
         }
 
-        WriteLog($"IMOD.READBACK.START: reason={reason} targets={targetBlocks.Count} showReading={showReadingStatus}");
+        WriteLog($"IMOD.READBACK.START: reason={reason} targets={targetBlocks.Count} testTargets={testBlocks.Count} showReading={showReadingStatus}");
 
         if (TryGetCachedImodKernelCiBlockStatus(out string blockedStatus, out string blockedDetail))
         {
@@ -665,6 +673,159 @@ public sealed partial class MainForm
             + $"map=\"{SanitizeLogValue(devicesAndInterrupts)}\" "
             + $"raw=\"{SanitizeLogValue(rawValues)}\" "
             + $"detail=\"{SanitizeLogValue(detail)}\"");
+    }
+
+    private void RefreshTestImodPreview(DeviceBlock block, string reason = "test-preview")
+    {
+        if (!block.Device.IsTestDevice || !IsUsbImodTarget(block.Device))
+        {
+            return;
+        }
+
+        EnsureImodConfigLoaded();
+        uint fallback = (_imodConfigCache?.GlobalInterval ?? ImodDefaultInterval) & 0xFFFF;
+        string text = block.ImodBox.Text?.Trim() ?? string.Empty;
+        if (!TryParseImodInput(text, fallback, out ImodInput parsedInput))
+        {
+            block.ImodCurrentLabel.Text = "current: invalid input";
+            block.ImodCurrentLabel.Tag = block.ImodCurrentLabel.Text;
+            block.ImodCurrentLabel.ForeColor = _statusDanger;
+            if (block.ImodMapLabel is not null)
+            {
+                block.ImodMapLabel.Text = "devices: invalid IMOD input";
+                block.ImodMapLabel.Tag = block.ImodMapLabel.Text;
+                block.ImodMapLabel.ForeColor = _statusDanger;
+                SetImodStatusTooltip(block.ImodMapLabel);
+            }
+
+            SetImodStatusTooltip(block.ImodCurrentLabel);
+            SetImodDetailsVisibility(block, forceVisible: true);
+            LogImodUiSnapshot(block, reason);
+            WriteLog($"IMOD.TEST.PREVIEW: {block.Device.InstanceId} invalid input=\"{SanitizeLogValue(text)}\"");
+            return;
+        }
+
+        List<uint> values = BuildTestImodPreviewValues(block.Device, parsedInput, fallback);
+        Dictionary<uint, List<string>> labelsByInterrupter = BuildTestImodPreviewLabels(block.Device);
+        string mappedDeviceLine = FormatMappedImodDeviceLine(values, labelsByInterrupter, [], FormatUnknownImodDeviceValue(values));
+        string visibleInterruptLines = FormatVisibleImodInterrupterLines(values);
+        string detailText =
+            $"{mappedDeviceLine}\r\n\r\n{visibleInterruptLines}\r\n{FormatDetailedImodInterrupterMap(values, labelsByInterrupter)}\r\n{FormatRawImodInterrupterMap(values)}\r\n{FormatTimeImodInterrupterMap(values)}\r\nsource: test preview only; no driver read/write";
+
+        block.ImodDefaultLabel.Text = $"default: {FormatImodValue(fallback)}";
+        block.ImodDefaultLabel.Tag = FormatImodValue(fallback);
+        block.ImodCurrentLabel.Text = $"current: {FormatImodValueList(values)}";
+        block.ImodCurrentLabel.Tag = $"test preview raw: {FormatImodValueListForLog(values)}";
+        block.ImodCurrentLabel.ForeColor = _statusActive;
+        SetImodStatusTooltip(block.ImodCurrentLabel);
+
+        if (block.ImodMapLabel is not null)
+        {
+            block.ImodMapLabel.Text = $"{mappedDeviceLine}\r\n\r\n{visibleInterruptLines}";
+            block.ImodMapLabel.Tag = detailText;
+            block.ImodMapLabel.ForeColor = _mutedText;
+            SetImodStatusTooltip(block.ImodMapLabel);
+        }
+
+        if (!block.ImodAutoCheck.Checked)
+        {
+            block.SuppressImodEvents++;
+            try
+            {
+                block.ImodAutoCheck.Checked = true;
+            }
+            finally
+            {
+                block.SuppressImodEvents--;
+            }
+        }
+
+        SetImodDetailsVisibility(block, forceVisible: true);
+        LogImodUiSnapshot(block, reason, values, detailText);
+        WriteLog($"IMOD.TEST.PREVIEW: {block.Device.InstanceId} values={FormatImodValueListForLog(values)} reason={reason}");
+    }
+
+    private static List<uint> BuildTestImodPreviewValues(DeviceInfo device, ImodInput input, uint fallback)
+    {
+        const int previewInterrupters = 8;
+        uint normalizedFallback = fallback & 0xFFFF;
+
+        if (input.Intervals is { Count: > 0 } intervals)
+        {
+            List<uint> values = intervals
+                .Take(previewInterrupters)
+                .Select(value => value & 0xFFFF)
+                .ToList();
+            while (values.Count < previewInterrupters)
+            {
+                values.Add(normalizedFallback);
+            }
+
+            return values;
+        }
+
+        if (input.RoleIntervals is { Count: > 0 } roleIntervals)
+        {
+            List<uint> values = Enumerable.Repeat(normalizedFallback, previewInterrupters).ToList();
+            HashSet<string> roles = BuildTestImodPreviewRoles(device);
+            if (roles.Count > 0 && TrySelectAdaptiveRoleInterval(roles, roleIntervals, out _, out uint selectedValue))
+            {
+                values[0] = selectedValue & 0xFFFF;
+            }
+
+            return values;
+        }
+
+        uint interval = (input.Interval ?? normalizedFallback) & 0xFFFF;
+        return Enumerable.Repeat(interval, previewInterrupters).ToList();
+    }
+
+    private static Dictionary<uint, List<string>> BuildTestImodPreviewLabels(DeviceInfo device)
+    {
+        Dictionary<string, List<string>> labelsByRole = new(StringComparer.OrdinalIgnoreCase);
+        AddAdaptiveRoleDisplayLabels(device.UsbRoles, labelsByRole);
+        AddAdaptiveRoleDisplayLabels(device.AudioEndpoints, labelsByRole);
+
+        List<string> labels = [];
+        HashSet<string> emitted = new(StringComparer.OrdinalIgnoreCase);
+        foreach (string role in AdaptiveRolePriority)
+        {
+            if (!labelsByRole.TryGetValue(role, out List<string>? roleLabels))
+            {
+                continue;
+            }
+
+            foreach (string label in roleLabels)
+            {
+                if (emitted.Add(label))
+                {
+                    labels.Add(label);
+                }
+            }
+        }
+
+        foreach (KeyValuePair<string, List<string>> pair in labelsByRole.OrderBy(static kvp => kvp.Key, StringComparer.OrdinalIgnoreCase))
+        {
+            foreach (string label in pair.Value)
+            {
+                if (emitted.Add(label))
+                {
+                    labels.Add(label);
+                }
+            }
+        }
+
+        return labels.Count > 0
+            ? new Dictionary<uint, List<string>> { [0] = labels }
+            : [];
+    }
+
+    private static HashSet<string> BuildTestImodPreviewRoles(DeviceInfo device)
+    {
+        Dictionary<string, List<string>> labelsByRole = new(StringComparer.OrdinalIgnoreCase);
+        AddAdaptiveRoleDisplayLabels(device.UsbRoles, labelsByRole);
+        AddAdaptiveRoleDisplayLabels(device.AudioEndpoints, labelsByRole);
+        return new HashSet<string>(labelsByRole.Keys, StringComparer.OrdinalIgnoreCase);
     }
 
     private void SetImodStatusTooltip(Control label)

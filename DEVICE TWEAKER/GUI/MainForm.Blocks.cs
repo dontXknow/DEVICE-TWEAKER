@@ -1089,6 +1089,7 @@ public sealed partial class MainForm
         txtImod.TextChanged += (_, _) => SyncImodDeviceEditorFromText();
         SyncImodDeviceEditorFromText();
 
+        DeviceBlock? createdBlock = null;
         Button btnImodApply = new()
         {
             Text = "SET",
@@ -1104,6 +1105,13 @@ public sealed partial class MainForm
         btnImodApply.Click += (_, _) =>
         {
             WriteLog("UI: SET IMOD button clicked");
+            DeviceBlock? targetBlock = createdBlock;
+            if (targetBlock is not null && targetBlock.Device.IsTestDevice)
+            {
+                RefreshTestImodPreview(targetBlock, "test-imod-set");
+                return;
+            }
+
             CreateDeviceTweakerBackup("pre-imod", showDialog: false);
             _ = ApplyImodSettings(out string? note);
             RefreshImodCurrentValues(reason: "imod-set");
@@ -1128,6 +1136,15 @@ public sealed partial class MainForm
         btnImodDelete.Click += (_, _) =>
         {
             WriteLog("UI: DELETE IMOD button clicked");
+            DeviceBlock? targetBlock = createdBlock;
+            if (targetBlock is not null && targetBlock.Device.IsTestDevice)
+            {
+                targetBlock.ImodBox.Text = FormatImodValue(ImodDefaultInterval);
+                UpdateImodSelectorsFromText(targetBlock);
+                RefreshTestImodPreview(targetBlock, "test-imod-delete");
+                return;
+            }
+
             ResetImodIntervalsToDefault("imod-delete");
             ShowThemedInfo("IMOD reset to defaults.\nStartup script and DTIMOD.sys removed.");
         };
@@ -1388,6 +1405,7 @@ public sealed partial class MainForm
             AffinityMask = 0,
             IrqCount = null,
         };
+        createdBlock = block;
 
         foreach (CheckBox cb in cpuBoxes)
         {
@@ -1481,6 +1499,14 @@ public sealed partial class MainForm
         allowWindowAutoExpand = false;
         _devicesPanel.Controls.Add(grp);
         _blocks.Add(block);
+        if (showImod && block.Device.IsTestDevice)
+        {
+            RefreshTestImodPreview(block, "test-block-init");
+        }
+        if (showNicItr)
+        {
+            RefreshNicItrBlock(block);
+        }
     }
 
     private void LayoutBlocks()

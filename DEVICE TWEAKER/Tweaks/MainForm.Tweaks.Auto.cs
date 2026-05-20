@@ -1072,20 +1072,30 @@ public sealed partial class MainForm
                 return TakeDedicatedUnits(count, allowCore0);
             }
 
-            List<AutoCpuUnit> candidates = GetCandidateUnits(preferredUnits, allowCore0)
+            List<AutoCpuUnit> topologyOrder = preferredUnits
+                .Where(unit => !unit.IsECore)
                 .OrderBy(unit => unit.Id)
+                .ThenBy(unit => unit.PrimaryLp)
                 .ToList();
-            if (candidates.Count < count)
+            Dictionary<int, int> topologyIndexByUnit = topologyOrder
+                .Select((unit, index) => (unit.Id, index))
+                .ToDictionary(item => item.Id, item => item.index);
+
+            HashSet<int> candidateUnitIds = GetCandidateUnits(preferredUnits, allowCore0)
+                .Where(unit => !unit.IsECore)
+                .Select(unit => unit.Id)
+                .ToHashSet();
+            if (candidateUnitIds.Count < count)
             {
                 return [];
             }
 
             List<(AutoCpuUnit First, AutoCpuUnit Second)> pairs = [];
-            for (int i = 0; i < candidates.Count - 1; i++)
+            for (int i = 0; i < topologyOrder.Count - 1; i++)
             {
-                AutoCpuUnit first = candidates[i];
-                AutoCpuUnit second = candidates[i + 1];
-                if (Math.Abs(first.Id - second.Id) != 1)
+                AutoCpuUnit first = topologyOrder[i];
+                AutoCpuUnit second = topologyOrder[i + 1];
+                if (!candidateUnitIds.Contains(first.Id) || !candidateUnitIds.Contains(second.Id))
                 {
                     continue;
                 }
@@ -1095,17 +1105,49 @@ public sealed partial class MainForm
 
             if (pairs.Count == 0)
             {
-                return TakeDedicatedUnits(count, allowCore0);
+                List<AutoCpuUnit> candidates = GetCandidateUnits(preferredUnits, allowCore0)
+                    .Where(unit => !unit.IsECore)
+                    .OrderBy(unit => topologyIndexByUnit.TryGetValue(unit.Id, out int index) ? index : int.MaxValue)
+                    .ThenBy(unit => unit.PrimaryLp)
+                    .ToList();
+                WriteLog($"AUTO.PLAN.GPU.PAIRS: none-adjacent fallbackCandidates=[{FormatAutoCpuUnits(candidates)}]");
+                return [];
             }
+
+            List<(AutoCpuUnit First, AutoCpuUnit Second)> nonCore0Pairs = pairs
+                .Where(pair => !pair.First.HasCore0 && !pair.Second.HasCore0)
+                .ToList();
+            if (nonCore0Pairs.Count > 0)
+            {
+                pairs = nonCore0Pairs;
+            }
+
+            string FormatGpuPair((AutoCpuUnit First, AutoCpuUnit Second) pair)
+            {
+                ulong mask = 0;
+                foreach (int lp in new[] { pair.First.PrimaryLp, pair.Second.PrimaryLp })
+                {
+                    if (lp >= 0 && lp < 64)
+                    {
+                        mask |= 1UL << lp;
+                    }
+                }
+
+                string ccx = HasVisibleCcxSplit() ? $"/ccx={pair.First.Ccx},{pair.Second.Ccx}" : string.Empty;
+                return $"[{pair.First.PrimaryLp},{pair.Second.PrimaryLp}]/mask=0x{mask:X}/ccd={pair.First.Ccd},{pair.Second.Ccd}{ccx}/rank={pair.First.Rank},{pair.Second.Rank}/rating={pair.First.Rating},{pair.Second.Rating}";
+            }
+
+            WriteLog($"AUTO.PLAN.GPU.PAIRS: candidates={pairs.Count} [{string.Join("; ", pairs.Select(FormatGpuPair))}]");
 
             (AutoCpuUnit First, AutoCpuUnit Second) selectedPair = _cppcEnabled
                 ? pairs
                     .OrderBy(pair => pair.First.Ccd == pair.Second.Ccd ? 0 : 1)
                     .ThenBy(pair => !HasVisibleCcxSplit() || pair.First.Ccx == pair.Second.Ccx ? 0 : 1)
-                    .ThenBy(pair => Math.Min(pair.First.Rank, pair.Second.Rank))
-                    .ThenBy(pair => (long)pair.First.Rank + pair.Second.Rank)
-                    .ThenByDescending(pair => (long)pair.First.Rating + pair.Second.Rating)
+                    .ThenByDescending(pair => Math.Min(pair.First.Rank, pair.Second.Rank))
+                    .ThenByDescending(pair => (long)pair.First.Rank + pair.Second.Rank)
+                    .ThenBy(pair => (long)pair.First.Rating + pair.Second.Rating)
                     .ThenByDescending(pair => Math.Max(pair.First.PrimaryLp, pair.Second.PrimaryLp))
+                    .ThenByDescending(pair => Math.Min(pair.First.PrimaryLp, pair.Second.PrimaryLp))
                     .First()
                 : pairs
                     .OrderBy(pair => pair.First.Ccd == pair.Second.Ccd ? 0 : 1)
@@ -1114,6 +1156,7 @@ public sealed partial class MainForm
                     .ThenByDescending(pair => Math.Min(pair.First.PrimaryLp, pair.Second.PrimaryLp))
                     .First();
 
+            WriteLog($"AUTO.PLAN.GPU.SELECT: {FormatGpuPair(selectedPair)} reason=irq-safe-tail-physical-pair");
             List<AutoCpuUnit> selected = [selectedPair.First, selectedPair.Second];
             foreach (AutoCpuUnit unit in selected)
             {
@@ -1259,7 +1302,7 @@ public sealed partial class MainForm
                 continue;
             }
 
-            AssignSlot(slot, units, "gpu-dedicated-high-physical-pair");
+            AssignSlot(slot, units, "gpu-dedicated-irq-safe-physical-pair");
             if (slot.Lps.Count > 0)
             {
                 SkipSpacingUnitIfAvailable("gpu");
