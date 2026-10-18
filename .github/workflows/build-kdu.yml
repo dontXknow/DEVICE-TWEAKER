@@ -1,0 +1,71 @@
+name: Build bundled KDU from source
+
+on:
+  push:
+    branches: [build/kdu-1.4.8]
+    paths:
+      - .github/workflows/build-kdu.yml
+      - DEVICE TWEAKER/IMOD/KDU/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native-build:
+    runs-on: windows-2022
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      - name: Build KDU and driver resource database
+        working-directory: DEVICE TWEAKER/IMOD/KDU
+        run: |
+          $ErrorActionPreference = 'Stop'
+          ./build-kdu.ps1 -Configuration Release -Platform x64 -PlatformToolset v143 -CopyToLoader
+
+      - name: Check versions and record artifact hashes without running KDU
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $output = Join-Path $env:GITHUB_WORKSPACE 'native-artifacts'
+          New-Item -ItemType Directory -Path $output | Out-Null
+          $records = @(foreach ($name in @('kdu.exe', 'drv64.dll')) {
+            $path = Join-Path $env:GITHUB_WORKSPACE "DEVICE TWEAKER/IMOD/Loader/$name"
+            $item = Get-Item -LiteralPath $path
+            if ($item.VersionInfo.FileVersion -ne '1.4.8.2605') {
+              throw "Unexpected file version for ${name}: $($item.VersionInfo.FileVersion)"
+            }
+            Copy-Item -LiteralPath $path -Destination (Join-Path $output $name)
+            [pscustomobject]@{
+              File = $name
+              Version = $item.VersionInfo.FileVersion
+              Bytes = $item.Length
+              SHA256 = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash
+            }
+          })
+          [pscustomobject]@{
+            Commit = $env:GITHUB_SHA
+            RunId = $env:GITHUB_RUN_ID
+            Runner = 'windows-2022'
+            Toolset = 'v143'
+            Configuration = 'Release|x64'
+            LoaderExecuted = $false
+            DriverLoaded = $false
+            Artifacts = $records
+          } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $output 'native-build.json') -Encoding utf8
+          Copy-Item -LiteralPath 'DEVICE TWEAKER/IMOD/KDU/LICENSE.txt' -Destination (Join-Path $output 'LICENSE-KDU.txt')
+          $records | Format-Table -AutoSize
+
+      - name: Upload native build
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: kdu-1.4.8.2605-win-x64
+          path: native-artifacts/
+          if-no-files-found: error
+          retention-days: 30
